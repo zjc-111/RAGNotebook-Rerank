@@ -5,46 +5,52 @@ export default {
   theme: {
     extend: {
       fontFamily: {
-        heading: ['Noto Serif SC', 'Songti SC', 'serif'],
+        heading: ['Playfair Display', 'Noto Serif SC', 'Songti SC', 'serif'],
         body: ['Noto Sans SC', 'PingFang SC', 'SF Pro Display', 'Helvetica Neue', 'sans-serif'],
         mono: ['JetBrains Mono', 'SF Mono', 'Consolas', 'monospace'],
       },
+      letterSpacing: {
+        display: '-0.03em',
+        heading: '-0.02em',
+        label: '0.14em',
+      },
       colors: {
         bg: {
-          DEFAULT: '#F7F6F3',
-          secondary: '#F0EFEC',
-          tertiary: '#F0EFEC',
+          DEFAULT: '#F7F4EF',
+          secondary: '#F1EDE6',
+          tertiary: '#EBE6DC',
         },
         card: {
           DEFAULT: '#FFFFFF',
-          hover: '#F9F9F8',
+          hover: '#FAF7F2',
         },
         text: {
-          DEFAULT: '#111111',
-          secondary: '#787774',
-          tertiary: '#A09E9A',
-          placeholder: '#BFBDB9',
+          DEFAULT: '#1C1B19',
+          secondary: '#6B6A66',
+          tertiary: '#9C9992',
+          placeholder: '#BEB9AE',
         },
         border: {
-          DEFAULT: '#EAEAEA',
-          light: '#F0F0EE',
+          DEFAULT: '#E2DCD1',
+          light: '#ECE7DD',
         },
-        divider: '#EEEEEC',
+        divider: '#E8E2D7',
         accent: {
-          DEFAULT: '#1F6C9F',
-          bg: '#E1F3FE',
+          DEFAULT: '#B4463C',
+          bg: '#F6E9E6',
         },
+        ink: '#1C1B19',
         success: {
-          DEFAULT: '#346538',
-          bg: '#EDF3EC',
+          DEFAULT: '#3F5E4B',
+          bg: '#EBF0EB',
         },
         danger: {
-          DEFAULT: '#9F2F2D',
-          bg: '#FDEBEC',
+          DEFAULT: '#8E3B36',
+          bg: '#F8E9E7',
         },
         warning: {
-          DEFAULT: '#956400',
-          bg: '#FBF3DB',
+          DEFAULT: '#8A6A34',
+          bg: '#F6EFDF',
         },
       },
       spacing: {
@@ -57,9 +63,9 @@ export default {
         '3xl': '64px',
       },
       borderRadius: {
-        sm: '4px',
-        md: '8px',
-        lg: '12px',
+        sm: '0px',
+        md: '2px',
+        lg: '4px',
       },
       lineHeight: {
         tight: '1.3',
