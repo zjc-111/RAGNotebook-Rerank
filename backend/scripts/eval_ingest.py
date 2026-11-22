@@ -25,6 +25,7 @@ import requests
 BACKEND = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND))
 
+from app.graph.storage.neo4j_client import ensure_graph_schema  # noqa: E402
 from app.graph.storage.neo4j_graph_store import Neo4jGraphStore  # noqa: E402
 from app.rag.text_spliter import AsyncTextSplitter  # noqa: E402
 from app.utils.factory import EmbedModelFactory  # noqa: E402
@@ -106,6 +107,7 @@ async def main() -> None:
     ap.add_argument("--clean", action="store_true", help="先 clear_all_docs 清空 eval 用户")
     ap.add_argument("--chunk-size", type=int, default=None, help="覆盖 document.yaml 的 chunk_size")
     ap.add_argument("--chunk-overlap", type=int, default=None)
+    ap.add_argument("--batch-size", type=int, default=25, help="每批文档数；嵌入内部再按供应商限制分批")
     args = ap.parse_args()
 
     queries, corpus, qrels = load_data(args.dataset_dir)
@@ -121,6 +123,9 @@ async def main() -> None:
 
     store = Neo4jGraphStore()
     model = EmbedModelFactory().generator()  # 与生产同款（OpenAI 兼容 /embeddings）
+    if model is None:
+        raise RuntimeError("嵌入配置不完整，请设置 EMBED_BASE_URL / EMBED_API_KEY / EMBED_MODEL_NAME")
+    await ensure_graph_schema(model)
     splitter = AsyncTextSplitter(chunk_size=args.chunk_size, chunk_overlap=args.chunk_overlap) if args.chunk_size else AsyncTextSplitter()
 
     if args.clean:
@@ -131,28 +136,40 @@ async def main() -> None:
     chunk_total = 0
     skip_empty = 0
     started = time.time()
-    # 每 doc 一批切分+嵌入+写入，便于进度展示
-    for i, did in enumerate(doc_ids, 1):
-        text = ctext.get(did, "")
-        if not text or not text.strip():
-            skip_empty += 1
-            continue
-        pieces = await splitter.split_text(text)
-        if not pieces:
-            skip_empty += 1
-            continue
-        vectors = await asyncio.to_thread(model.embed_documents, pieces)
-        chunks = [
-            {"chunk_index": idx, "text": piece, "embedding": vectors[idx]}
-            for idx, piece in enumerate(pieces)
-        ]
-        title = ctitle.get(did) or f"doc-{did}"
-        await store.ensure_source_node(args.user_id, "doc", did, title)
-        await store.upsert_chunks(args.user_id, "doc", did, title, chunks)
-        ingest_total += 1
-        chunk_total += len(chunks)
-        if i % 25 == 0 or i == len(doc_ids):
-            print(f"[ingest] {i}/{len(doc_ids)} docs ({time.time()-started:.0f}s) chunks={chunk_total}")
+    # 批量切片后合并嵌入，避免单 chunk 文档也产生一次独立 API 请求；写入仍按 doc 保持幂等。
+    for start_idx in range(0, len(doc_ids), max(1, args.batch_size)):
+        batch_ids = doc_ids[start_idx:start_idx + max(1, args.batch_size)]
+        prepared: list[tuple[str, list[str]]] = []
+        for did in batch_ids:
+            text = ctext.get(did, "")
+            if not text or not text.strip():
+                skip_empty += 1
+                continue
+            pieces = await splitter.split_text(text)
+            if not pieces:
+                skip_empty += 1
+                continue
+            prepared.append((did, pieces))
+
+        flat_pieces = [piece for _, pieces in prepared for piece in pieces]
+        flat_vectors = await asyncio.to_thread(model.embed_documents, flat_pieces) if flat_pieces else []
+        vector_idx = 0
+        for did, pieces in prepared:
+            vectors = flat_vectors[vector_idx:vector_idx + len(pieces)]
+            vector_idx += len(pieces)
+            chunks = [
+                {"chunk_index": idx, "text": piece, "embedding": vectors[idx]}
+                for idx, piece in enumerate(pieces)
+            ]
+            title = ctitle.get(did) or f"doc-{did}"
+            await store.ensure_source_node(args.user_id, "doc", did, title)
+            await store.upsert_chunks(args.user_id, "doc", did, title, chunks)
+            ingest_total += 1
+            chunk_total += len(chunks)
+
+        processed = start_idx + len(batch_ids)
+        if processed % 250 < len(batch_ids) or processed == len(doc_ids):
+            print(f"[ingest] {processed}/{len(doc_ids)} docs ({time.time()-started:.0f}s) chunks={chunk_total}", flush=True)
 
     manifest = {
         "source_dataset": DATASET_REPO,

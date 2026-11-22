@@ -1,6 +1,6 @@
-"""云端重排序服务：调用 rerank API（SiliconFlow / Jina / Cohere 兼容协议）。
+"""云端重排序服务：调用 rerank API（SiliconFlow / Jina / DashScope 等兼容协议）。
 
-接口约定：POST {RERANKER_API_BASE_URL}/rerank，payload {"model", "query", "documents"}，
+接口约定：POST {RERANKER_API_BASE_URL}{RERANKER_API_PATH}，payload {"model", "query", "documents"}，
 响应 {"results": [{"index": int, "relevance_score": float}, ...]}。
 API 未配置或调用失败时返回 success=False，由调用方按原顺序 + similarity 0 降级。
 """
@@ -20,13 +20,14 @@ class ReorderService:
         self.api_base_url = (settings.RERANKER_API_BASE_URL or "").rstrip("/")
         self.api_key = settings.RERANKER_API_KEY
         self.model = settings.RERANKER_MODEL
+        self.api_path = "/" + (settings.RERANKER_API_PATH or "/rerank").lstrip("/")
         self.http_client_factory = http_client_factory or httpx.AsyncClient
 
     async def _rerank(self, query: str, documents: list[str]) -> list[float]:
         """调用 rerank API，按文档原顺序返回相关性分数。"""
         async with self.http_client_factory(timeout=10.0) as client:
             resp = await client.post(
-                f"{self.api_base_url}/rerank",
+                f"{self.api_base_url}{self.api_path}",
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 json={"model": self.model, "query": query, "documents": documents},
             )
@@ -34,6 +35,16 @@ class ReorderService:
             data = resp.json()
         results = sorted(data.get("results", []), key=lambda r: r.get("index", 0))
         return [float(r.get("relevance_score", 0.0)) for r in results]
+
+    async def score_documents(self, query: str, documents: list[str]) -> list[float] | None:
+        """返回与 documents 同序的相关性分数；调用失败返回 None 由调用方降级。"""
+        if not documents:
+            return []
+        try:
+            return await self._rerank(query, documents)
+        except Exception as e:
+            logger.warning(f"【重排序服务】精排失败，按原顺序降级: {e}")
+            return None
 
     async def reorder_documents(self, query: str, documents: list[str], thinking_callback=None) -> dict[str, Any]:
         """

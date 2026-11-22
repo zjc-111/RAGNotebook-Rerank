@@ -2,7 +2,8 @@
 
 对每条 query 走真实检索原语：
     query_embedding = embed_model.embed_query(q)
-    hits = Neo4jGraphStore.search_chunks(user_id, emb, q, kinds=["doc"], limit=--limit)
+    hits = Neo4jGraphStore.search_chunks(user_id, emb, q, kinds=["doc"], limit=召回池大小)
+    --rerank 开启时复用 LocalRetriever 的召回池扩展与 _rerank_hits() 精排逻辑。
 按 chunk 的 source_id 去重映射回文档，得到文档级排序，再对齐 manifest 的相关文档算指标。
 
 指标（相关性 qrels 为二元，score=1）
@@ -27,7 +28,10 @@ from pathlib import Path
 BACKEND = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND))
 
+from app.core.settings import settings  # noqa: E402
 from app.graph.storage.neo4j_graph_store import Neo4jGraphStore  # noqa: E402
+from app.rag.agentic_rag.local_retriever import LocalRetriever  # noqa: E402
+from app.rag.reorder_service import ReorderService  # noqa: E402
 from app.utils.factory import EmbedModelFactory  # noqa: E402
 
 TOP_Ks = [1, 3, 5, 10]
@@ -88,8 +92,12 @@ async def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", type=Path, default=BACKEND / "results" / "eval_retrieval" / "manifest.json")
     ap.add_argument("--results-dir", type=Path, default=BACKEND / "results" / "eval_retrieval")
-    ap.add_argument("--limit", type=int, default=100, help="检索池/文档级截断；MAP 以该值为上限")
-    ap.add_argument("--warmup", type=int, default=1, help="跑 N 条占位 query 预热索引后再计时")
+    ap.add_argument("--limit", type=int, default=100, help="最终 chunk topK；MAP 以该值为上限")
+    ap.add_argument("--warmup", type=int, default=1, help="跑 N 条真实 query 预热索引后再计时")
+    ap.add_argument("--rerank", action="store_true", help="扩大召回池并执行 LocalRetriever 云端精排")
+    ap.add_argument("--max-queries", type=int, default=None, help="仅评测前 N 条 query（默认全部）")
+    ap.add_argument("--recall-limit", type=int, default=None,
+                    help="覆盖召回池大小；用于「同召回池、不精排」的消融对照")
     args = ap.parse_args()
 
     m = json.loads(args.manifest.read_text(encoding="utf-8"))
@@ -97,22 +105,62 @@ async def main() -> None:
     query_text = m["query_text"]
     relevant = m["relevant_docs"]
     qids = m["query_ids"]
+    if args.max_queries:
+        qids = qids[:args.max_queries]
 
     store = Neo4jGraphStore()
     model = EmbedModelFactory().generator()
+    if model is None:
+        raise RuntimeError("嵌入配置不完整，请设置 EMBED_BASE_URL / EMBED_API_KEY / EMBED_MODEL_NAME")
+
+    # 防止 Neo4j 未灌入 manifest 对应语料时生成全零的无效报告。
+    doc_rows = await store._run(
+        "MATCH (d:Doc) WHERE d.user_id=$uid AND d.id IN $doc_ids RETURN count(DISTINCT d.id) AS count",
+        {"uid": user_id, "doc_ids": m["doc_ids"]},
+    )
+    chunk_rows = await store._run(
+        "MATCH (c:Chunk {user_id:$uid, kind:'doc'}) RETURN count(c) AS count", {"uid": user_id}
+    )
+    expected_docs = m.get("ingested_doc_count") or len(m["doc_ids"])
+    expected_chunks = m.get("total_chunks") or 0
+    actual_docs = doc_rows[0]["count"]
+    actual_chunks = chunk_rows[0]["count"]
+    if actual_docs < expected_docs or actual_chunks < expected_chunks:
+        raise RuntimeError(
+            f"Neo4j 语料不完整：docs={actual_docs}/{expected_docs}, chunks={actual_chunks}/{expected_chunks}；"
+            "请先运行 scripts/eval_ingest.py"
+        )
+
+    settings.RAG_RERANK_ENABLED = args.rerank
+    settings.RAG_CACHE_ENABLED = False
+    rerank_service = ReorderService() if args.rerank else None
+    retriever = LocalRetriever(reorder_service=rerank_service, cache_enabled=False)
+    recall_limit = args.recall_limit or retriever._recall_limit(args.limit)
+
+    if rerank_service is not None:
+        if not (settings.RERANKER_API_BASE_URL and settings.RERANKER_API_KEY and settings.RERANKER_MODEL):
+            raise RuntimeError("Rerank 配置不完整，请设置 RERANKER_API_BASE_URL / RERANKER_API_KEY / RERANKER_MODEL")
+        probe = await rerank_service.score_documents("检索评测", ["检索评测使用重排序模型", "无关文档"])
+        if probe is None or len(probe) != 2:
+            raise RuntimeError("Rerank 服务预检失败，停止评测以避免把降级结果计入精排报告")
+        print(f"[preflight] Rerank API 可用：{settings.RERANKER_MODEL}")
+    print(f"[preflight] 语料完整：docs={actual_docs}, chunks={actual_chunks}; mode={'rerank' if args.rerank else 'baseline'}")
 
     async def search(q: str):
         emb = await asyncio.to_thread(model.embed_query, q)
-        hits = await store.search_chunks(user_id, emb, q, ["doc"], args.limit)
+        hits = await store.search_chunks(user_id, emb, q, ["doc"], recall_limit)
+        hits = await retriever._rerank_hits(q, hits, args.limit)
+        if args.rerank and len(hits) > 1 and any("rerank_score" not in hit.metadata for hit in hits):
+            raise RuntimeError("本次 query 未写入 rerank_score，服务可能已降级；停止生成无效对照报告")
         return _ranked_doc_ids(hits)
 
     # 预热
     for _ in range(args.warmup):
-        await search(qids[0])
+        await search(query_text.get(qids[0], ""))
 
     rows = []
     latencies = []
-    for qid in qids:
+    for index, qid in enumerate(qids, 1):
         qtext = query_text.get(qid, "")
         gt = set(relevant.get(qid, []))
         t0 = time.time()
@@ -122,6 +170,8 @@ async def main() -> None:
         metrics = _metrics_for(ranked, gt)
         rows.append({"query_id": qid, "query": qtext, "latency_ms": round(dt, 1),
                      "top_doc_ids": ranked, "relevant_count": len(gt), **metrics})
+        if index % 25 == 0 or index == len(qids):
+            print(f"[eval] {index}/{len(qids)} queries")
 
     agg = {f"recall@{k}": round(sum(r[f"recall@{k}"] for r in rows) / len(rows), 4) for k in TOP_Ks}
     agg.update({f"hit@{k}": round(sum(r[f"hit@{k}"] for r in rows) / len(rows), 4) for k in TOP_Ks})
@@ -138,10 +188,14 @@ async def main() -> None:
     }
     summary = {
         "user_id": user_id,
+        "mode": "rerank" if args.rerank else "baseline",
         "n_queries": len(rows),
         "n_docs": len(m["doc_ids"]),
         "total_chunks": m.get("total_chunks"),
         "source_dataset": m.get("source_dataset"),
+        "top_k": args.limit,
+        "recall_limit": recall_limit,
+        "rerank_model": settings.RERANKER_MODEL if args.rerank else None,
         "aggregate": agg,
     }
 
@@ -151,6 +205,9 @@ async def main() -> None:
     md = ["# 检索信息量评测报告", ""]
     md.append(f"- 数据集：{m.get('source_dataset')}  (queries={len(qids)}, docs={len(m['doc_ids'])}, chunks={m.get('total_chunks')})")
     md.append(f"- 评测用户：`{user_id}`")
+    md.append(f"- 模式：{'RRF + Rerank' if args.rerank else 'RRF baseline'}；最终 topK={args.limit}，召回池={recall_limit}")
+    if args.rerank:
+        md.append(f"- Rerank 模型：`{settings.RERANKER_MODEL}`")
     md.append("- 指标：recall@k（相关文档被召回占比）、hit@k（至少召回一条相关文档）、MRR（首个相关文档的倒数排名）、nDCG@10（排序质量）、MAP（平均精度）")
     md.append("")
     md.append("| 指标 | 值 |")

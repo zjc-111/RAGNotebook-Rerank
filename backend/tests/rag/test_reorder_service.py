@@ -1,6 +1,13 @@
 """reorder_service.py — ReorderService 云端 rerank 逻辑测试（不发真实网络请求）。"""
+import pytest
 
+from app.core.settings import settings
 from app.rag.reorder_service import ReorderService
+
+
+@pytest.fixture(autouse=True)
+def isolate_rerank_settings(monkeypatch):
+    monkeypatch.setattr(settings, "RERANKER_API_PATH", "/rerank")
 
 
 class FakeAsyncClient:
@@ -70,6 +77,13 @@ class TestReorderDocuments:
         assert req["headers"]["Authorization"] == "Bearer sk-test"
         assert req["json"] == {"model": "test-reranker", "query": "q", "documents": ["a"]}
 
+    async def test_request_supports_configurable_api_path(self):
+        service, client = _make_service(payload=_rerank_payload([0.5]))
+        service.api_base_url = "https://dashscope.aliyuncs.com/compatible-api/v1"
+        service.api_path = "/reranks"
+        await service.score_documents("q", ["a"])
+        assert client.requests[0]["url"] == "https://dashscope.aliyuncs.com/compatible-api/v1/reranks"
+
     async def test_success_with_thinking_callback(self):
         calls = []
 
@@ -102,6 +116,22 @@ class TestReorderDocuments:
         service, _ = _make_service(payload=_rerank_payload([1.0]))
         result = await service.reorder_documents("q", ["a"])
         assert result["success"] is True
+
+
+class TestScoreDocuments:
+    async def test_returns_scores_in_original_order(self):
+        service, _ = _make_service(payload=_rerank_payload([0.2, 0.8, 0.5]))
+        scores = await service.score_documents("q", ["a", "b", "c"])
+        assert scores == [0.2, 0.8, 0.5]
+
+    async def test_empty_documents_short_circuits_without_request(self):
+        service, client = _make_service(payload=_rerank_payload([]))
+        assert await service.score_documents("q", []) == []
+        assert client.requests == []
+
+    async def test_failure_returns_none_for_caller_fallback(self):
+        service, _ = _make_service(exc=RuntimeError("rerank 不可用"))
+        assert await service.score_documents("q", ["a", "b"]) is None
 
 
 class TestFormatReorderResult:

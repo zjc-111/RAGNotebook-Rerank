@@ -77,6 +77,18 @@ class Settings(BaseSettings):
     RERANKER_API_BASE_URL: str = ""
     RERANKER_API_KEY: str = ""
     RERANKER_MODEL: str = ""
+    RERANKER_API_PATH: str = "/rerank"
+
+    # RAG 两阶段检索：RRF 召回 top_k×倍率 → rerank 精排 → 截断 top_k
+    RAG_RERANK_ENABLED: bool = True
+    RAG_RECALL_MULTIPLIER: int = 3
+    RAG_RERANK_MAX_CANDIDATES: int = 30
+    # 精排后最低相关性分数（各厂商分数量纲不同，默认 0 不丢证据）
+    RAG_RERANK_MIN_SCORE: float = 0.0
+
+    # 检索结果缓存（需 Redis；按用户 + 查询归一化隔离）
+    RAG_CACHE_ENABLED: bool = False
+    RAG_CACHE_TTL_S: int = 120
 
     # 限流全局开关
     RATE_LIMIT_ENABLED: bool = True
