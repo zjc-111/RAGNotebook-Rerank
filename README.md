@@ -1,5 +1,24 @@
 # RAG NoteBook— 智能笔记助手
 
+> **本项目基于 [RMA-MUN/RAGNotebook](https://github.com/RMA-MUN/RAGNotebook)（MIT）二次开发，改动集中在检索链路。**
+>
+> | 改动 | 说明 |
+> | --- | --- |
+> | 两阶段检索 | RRF 召回池扩至 `topK × 3`（上限 30）→ Cross-Encoder 精排 → 阈值过滤 → topK；精排超时、异常或返回条数不匹配时按原 RRF 顺序降级 |
+> | 用户级检索缓存 | Redis 缓存最终证据，key 含 `user_id`、归一化 query、topK、检索范围与精排开关，TTL 默认 120s，Redis 故障自动回源 |
+> | 证据近重复过滤 | 字符 bigram + Jaccard ≥ 0.9 去重，并为单条证据设置字符预算，避免长文挤占上下文 |
+> | 可复现评测 | 修正评测脚本使其真正执行精排，新增语料/配置/服务探针预检与静默降级检测 |
+>
+> **实测（DuRetrieval，500 query / 20,000 docs，本地 BGE 模型）**
+>
+> | 组别 | Recall@5 | nDCG@10 | MAP | p50 |
+> | --- | --- | --- | --- | --- |
+> | RRF@10 → top10 | 0.7160 | 0.8446 | 0.7576 | 60 ms |
+> | RRF@30 → top10（扩池不精排） | 0.7030 | 0.8358 | 0.7520 | 43 ms |
+> | RRF@30 → 精排 → top10 | **0.8002** | **0.9210** | **0.8689** | 725 ms |
+>
+> 消融结论：扩大召回池本身会引入噪声导致指标微降，收益主要来自精排。报告见 [`backend/results/`](./backend/results)。
+
 <div align="center">
 <a href="https://github.com/RMA-MUN/RAGNotebook/stargazers">
   <img src="https://img.shields.io/github/stars/RMA-MUN/RAGNotebook?style=flat-square&label=Stars&color=orange" alt="Stars">
